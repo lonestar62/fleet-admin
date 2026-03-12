@@ -5,13 +5,19 @@ const express = require('express');
 const session = require('express-session');
 const { Pool } = require('pg');
 const crypto = require('crypto');
+const { exec } = require('child_process');
 const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3013;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'Claw2026-DeepTx99';
+const ADMIN_VAULT_PASSWORD = 'DeepTx-Admin99';
 const VAULT_KEY = process.env.VAULT_KEY || crypto.randomBytes(32).toString('hex');
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const GCP_PROJECT = 'boxwood-yen-465815-h0';
+const GCP_SA_KEY = '/opt/admin/gcp-sa.json';
+const CLAWFORGE_IP = '34.10.77.209';
+const SSH_KEY = '/home/rod/.ssh/google_compute_engine';
 
 // DB pool
 const pool = new Pool({
@@ -62,6 +68,16 @@ function decrypt(enc) {
     dec += decipher.final('utf8');
     return dec;
   } catch { return '[decrypt error]'; }
+}
+
+// Run shell command, return promise
+function runCmd(cmd, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const child = exec(cmd, { timeout: timeoutMs }, (err, stdout, stderr) => {
+      if (err) reject(new Error(stderr || err.message));
+      else resolve(stdout.trim());
+    });
+  });
 }
 
 app.use(express.json());
@@ -115,15 +131,91 @@ app.get('/vault', requireAuth, (req, res) => res.send(vaultPage()));
 // Launcher page
 app.get('/launcher', requireAuth, (req, res) => res.send(launcherPage()));
 
+// Infrastructure page
+app.get('/infrastructure', requireAuth, (req, res) => res.send(infrastructurePage()));
+
+// === STATUS API ===
+// Check service statuses on fleet-vm (local) and clawforge-vm (SSH)
+app.get('/api/status', requireAuth, async (req, res) => {
+  const fleetServices = [
+    'keeper', 'brain', 'detexai', 'bde', 'creator', 'barback',
+    'wedding', 'bigfoot', 'bigfoot-backend', 'mop', 'creeksideai',
+    'huron', 'lobster', 'netgrapher', 'admin', 'deploy-webhook'
+  ];
+  const clawforgeServices = [
+    'clawforgeai', 'portal', 'clawforge-admin'
+  ];
+
+  const checkLocal = async (services) => {
+    const results = {};
+    await Promise.all(services.map(async svc => {
+      try {
+        const out = await runCmd(`systemctl is-active ${svc}.service`);
+        results[svc] = out === 'active';
+      } catch {
+        results[svc] = false;
+      }
+    }));
+    return results;
+  };
+
+  const checkRemote = async (services) => {
+    const results = {};
+    const checks = services.map(s => `systemctl is-active ${s}.service`).join('; ');
+    try {
+      const out = await runCmd(
+        `ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=8 rod@${CLAWFORGE_IP} "${checks} ; true"`,
+        20000
+      );
+      const lines = out.split('\n');
+      services.forEach((svc, i) => {
+        results[svc] = (lines[i] || '').trim() === 'active';
+      });
+    } catch {
+      services.forEach(svc => { results[svc] = null; }); // null = SSH failed
+    }
+    return results;
+  };
+
+  try {
+    const [fleetStatus, clawforgeStatus] = await Promise.all([
+      checkLocal(fleetServices),
+      checkRemote(clawforgeServices)
+    ]);
+    res.json({ fleet: fleetStatus, clawforge: clawforgeStatus });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // === VAULT API ===
 app.get('/api/vault', requireAuth, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM vault_entries ORDER BY name ASC');
+    const isAdmin = req.headers['x-admin-mode'] === '1';
     const entries = result.rows.map(r => ({
-      ...r,
-      password_dec: decrypt(r.password_enc)
+      id: r.id,
+      name: r.name,
+      username: r.username,
+      url: r.url,
+      notes: r.notes,
+      created_at: r.created_at,
+      updated_at: r.updated_at,
+      // Only return decrypted password if admin mode header present
+      password_dec: isAdmin ? decrypt(r.password_enc) : null
     }));
     res.json(entries);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Reveal single password (requires admin mode)
+app.get('/api/vault/:id/reveal', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT password_enc FROM vault_entries WHERE id=$1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json({ password: decrypt(result.rows[0].password_enc) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -164,25 +256,77 @@ app.delete('/api/vault/:id', requireAuth, async (req, res) => {
   }
 });
 
+// === GCP SECRET MANAGER API ===
+app.get('/api/gcp-secrets', requireAuth, async (req, res) => {
+  try {
+    const out = await runCmd(
+      `GOOGLE_APPLICATION_CREDENTIALS=${GCP_SA_KEY} gcloud secrets list --project=${GCP_PROJECT} --format=json`,
+      15000
+    );
+    let secrets = [];
+    try { secrets = JSON.parse(out); } catch { secrets = []; }
+    // Map to cleaner structure, extract useful fields
+    const mapped = secrets.map(s => ({
+      name: s.name ? s.name.split('/').pop() : '',
+      fullName: s.name || '',
+      createTime: s.createTime || null,
+      replication: s.replication || null,
+      labels: s.labels || {},
+    }));
+    res.json({ secrets: mapped, project: GCP_PROJECT });
+  } catch (err) {
+    res.status(500).json({ error: err.message, hint: 'Check gcloud auth / SA key at ' + GCP_SA_KEY });
+  }
+});
+
+// Get latest version of a secret (admin mode only — enforced by header check)
+app.get('/api/gcp-secrets/:name', requireAuth, async (req, res) => {
+  if (req.headers['x-admin-mode'] !== '1') {
+    return res.status(403).json({ error: 'Admin mode required' });
+  }
+  const secretName = req.params.name.replace(/[^a-zA-Z0-9_\-]/g, '');
+  if (!secretName) return res.status(400).json({ error: 'Invalid secret name' });
+  try {
+    const value = await runCmd(
+      `GOOGLE_APPLICATION_CREDENTIALS=${GCP_SA_KEY} gcloud secrets versions access latest --secret=${secretName} --project=${GCP_PROJECT}`,
+      10000
+    );
+    res.json({ value });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // === HTML PAGES ===
 
+const FLEET_VM_APPS = [
+  { name: 'Keeper / NCL', svc: 'keeper', port: 3006, url: 'https://keeper.deeptxai.com', desc: 'NCL brain & memory' },
+  { name: 'Brain', svc: 'brain', port: 3001, url: 'https://brain.deeptxai.com', desc: 'Dr. Bauer neuroimaging' },
+  { name: 'DetexAI', svc: 'detexai', port: 3003, url: 'https://detexai.deeptxai.com', desc: 'Agency app' },
+  { name: 'BDE', svc: 'bde', port: 3004, url: 'https://bde.deeptxai.com', desc: 'Business Discovery Engine' },
+  { name: 'Creator Ops', svc: 'creator', port: 3005, url: 'https://creator.deeptxai.com', desc: 'Creator Ops Studio' },
+  { name: 'Barback', svc: 'barback', port: 3007, url: 'https://barback.deeptxai.com', desc: 'Bar management' },
+  { name: 'Wedding', svc: 'wedding', port: 3002, url: 'https://wedding.deeptxai.com', desc: 'Wedding planner' },
+  { name: 'Bigfoot', svc: 'bigfoot', port: 3000, url: 'https://bigfoot.deeptxai.com', desc: 'Bigfoot app (FE:3000 API:8000)' },
+  { name: 'MOP', svc: 'mop', port: 3008, url: 'https://mop.deeptxai.com', desc: 'MOP automation' },
+  { name: 'CreeksideAI', svc: 'creeksideai', port: 3009, url: 'https://creeksideai.deeptxai.com', desc: 'AI datacenter investor' },
+  { name: 'Huron County', svc: 'huron', port: 5000, url: 'https://huroncounty.deeptxai.com', desc: 'County chatbot' },
+  { name: 'Lobster', svc: 'lobster', port: 4000, url: 'https://app.deeptxai.com', desc: 'Lobster Cloud PWA' },
+  { name: 'NetGrapher', svc: 'netgrapher', port: 3012, url: 'https://netgrapher.deeptxai.com', desc: 'Network visualization' },
+  { name: 'Admin', svc: 'admin', port: 3013, url: 'https://admin.deeptxai.com', desc: 'Fleet admin & vault' },
+  { name: 'Deploy Webhook', svc: 'deploy-webhook', port: 9101, url: null, desc: 'GitHub deploy webhook' },
+];
+
+const CLAWFORGE_VM_APPS = [
+  { name: 'ClawForge AI', svc: 'clawforgeai', port: 3010, url: 'https://clawforgeai.com', desc: 'ClawForge SaaS (Next.js)' },
+  { name: 'Portal', svc: 'portal', port: 3011, url: 'https://portal.clawforgeai.com', desc: 'ClawForge portal' },
+  { name: 'ClawForge Admin', svc: 'clawforge-admin', port: 3014, url: null, desc: 'ClawForge admin dashboard' },
+];
+
+// Legacy flat list for launcher
 const FLEET_APPS = [
-  { name: "Keeper / NCL", url: "https://keeper.deeptxai.com", desc: "NCL brain & memory" },
-  { name: "Brain", url: "https://brain.deeptxai.com", desc: "Dr. Bauer neuroimaging" },
-  { name: "DetexAI", url: "https://detexai.deeptxai.com", desc: "Agency app" },
-  { name: "BDE", url: "https://bde.deeptxai.com", desc: "Business Discovery Engine" },
-  { name: "Creator Ops", url: "https://creator.deeptxai.com", desc: "Creator Ops Studio" },
-  { name: "Barback", url: "https://barback.deeptxai.com", desc: "Bar management" },
-  { name: "Wedding", url: "https://wedding.deeptxai.com", desc: "Wedding planner" },
-  { name: "Bigfoot", url: "https://bigfoot.deeptxai.com", desc: "Bigfoot app" },
-  { name: "MOP", url: "https://mop.deeptxai.com", desc: "MOP automation" },
-  { name: "CreeksideAI", url: "https://creeksideai.deeptxai.com", desc: "AI datacenter investor" },
-  { name: "Huron County", url: "https://huroncounty.deeptxai.com", desc: "County chatbot" },
-  { name: "Lobster", url: "https://app.deeptxai.com", desc: "Lobster Cloud PWA" },
-  { name: "NetGrapher", url: "https://netgrapher.deeptxai.com", desc: "Network visualization" },
-  { name: "ClawForge", url: "https://clawforgeai.com", desc: "ClawForge SaaS" },
-  { name: "Portal", url: "https://portal.clawforgeai.com", desc: "ClawForge portal" },
-  { name: "Admin", url: "https://admin.deeptxai.com", desc: "Fleet admin & passwords" },
+  ...FLEET_VM_APPS.filter(a => a.url).map(a => ({ name: a.name, url: a.url, desc: a.desc })),
+  ...CLAWFORGE_VM_APPS.filter(a => a.url).map(a => ({ name: a.name, url: a.url, desc: a.desc })),
 ];
 
 const BASE_STYLES = `
@@ -215,23 +359,54 @@ const BASE_STYLES = `
   
   /* Cards */
   .card { background: #0f0f1a; border: 1px solid rgba(99,102,241,0.12); border-radius: 12px; padding: 20px; }
-  .card-title { font-size: 13px; font-weight: 600; color: #a78bfa; margin-bottom: 16px; display: flex; align-items: center; gap-8px; }
+  .card-title { font-size: 13px; font-weight: 600; color: #a78bfa; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
   
   /* App grid */
-  .app-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
-  .app-tile { background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; padding: 14px; transition: all 0.2s; cursor: pointer; display: block; }
+  .app-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; }
+  .app-tile { background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; padding: 12px; transition: all 0.2s; cursor: pointer; display: block; }
   .app-tile:hover { background: rgba(99,102,241,0.08); border-color: rgba(99,102,241,0.3); transform: translateY(-1px); }
-  .app-tile-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; }
-  .app-tile-name { font-size: 13px; font-weight: 600; color: #f1f5f9; }
+  .app-tile-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 6px; }
+  .app-tile-name { font-size: 12px; font-weight: 600; color: #f1f5f9; }
   .app-tile:hover .app-tile-name { color: #a78bfa; }
-  .app-tile-status { display: flex; align-items: center; gap: 4px; }
-  .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #34d399; box-shadow: 0 0 6px rgba(52,211,153,0.5); }
-  .app-tile-desc { font-size: 11px; color: #64748b; line-height: 1.4; }
-  .app-tile-url { font-size: 10px; color: rgba(99,102,241,0.5); font-family: monospace; margin-top: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .app-tile-port { font-size: 10px; color: #475569; font-family: monospace; }
+  .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #94a3b8; flex-shrink: 0; }
+  .status-dot.green { background: #34d399; box-shadow: 0 0 6px rgba(52,211,153,0.5); }
+  .status-dot.red { background: #f87171; box-shadow: 0 0 6px rgba(248,113,113,0.4); }
+  .status-dot.loading { background: #f59e0b; animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  .app-tile-desc { font-size: 10px; color: #64748b; line-height: 1.4; margin-bottom: 6px; }
+  .app-tile-url { font-size: 9px; color: rgba(99,102,241,0.5); font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .app-tile:hover .app-tile-url { color: rgba(99,102,241,0.8); }
   
+  /* VM cards */
+  .vm-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
+  .vm-card { background: #0f0f1a; border: 1px solid rgba(99,102,241,0.15); border-radius: 14px; padding: 20px; }
+  .vm-card-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+  .vm-icon { width: 36px; height: 36px; background: linear-gradient(135deg, rgba(99,102,241,0.2), rgba(139,92,246,0.2)); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 18px; }
+  .vm-name { font-size: 14px; font-weight: 700; color: #f1f5f9; }
+  .vm-meta { font-size: 11px; color: #64748b; margin-top: 2px; }
+  .vm-badge { font-size: 10px; background: rgba(99,102,241,0.15); color: #a78bfa; padding: 2px 8px; border-radius: 4px; font-weight: 500; }
+  
+  /* Summary bar */
+  .summary-bar { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .summary-item { background: rgba(99,102,241,0.06); border: 1px solid rgba(99,102,241,0.15); border-radius: 10px; padding: 14px; }
+  .summary-value { font-size: 24px; font-weight: 700; color: #a78bfa; }
+  .summary-label { font-size: 10px; color: #64748b; margin-top: 3px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .summary-sub { font-size: 11px; color: #94a3b8; margin-top: 2px; font-family: monospace; }
+  
+  /* Relationship diagram */
+  .rel-diagram { background: rgba(0,0,0,0.3); border: 1px solid rgba(99,102,241,0.12); border-radius: 12px; padding: 24px; margin-bottom: 20px; }
+  .rel-diagram-title { font-size: 12px; color: #64748b; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 20px; }
+  .rel-row { display: flex; align-items: center; justify-content: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  .rel-node { background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.3); border-radius: 8px; padding: 8px 14px; font-size: 12px; font-weight: 600; color: #a78bfa; white-space: nowrap; }
+  .rel-node.db { background: rgba(34,211,153,0.08); border-color: rgba(34,211,153,0.3); color: #34d399; }
+  .rel-node.sub { background: rgba(99,102,241,0.05); border-color: rgba(99,102,241,0.15); color: #818cf8; font-weight: 400; font-size: 11px; }
+  .rel-arrow { color: #475569; font-size: 14px; }
+  .rel-down { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .rel-vert-arrow { color: #475569; font-size: 14px; line-height: 1; }
+  
   /* Vault */
-  .vault-toolbar { display: flex; gap: 10px; margin-bottom: 16px; align-items: center; }
+  .vault-toolbar { display: flex; gap: 10px; margin-bottom: 16px; align-items: center; flex-wrap: wrap; }
   .btn { padding: 8px 16px; border-radius: 7px; border: none; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.15s; }
   .btn-primary { background: linear-gradient(135deg, #6366f1, #8b5cf6); color: white; }
   .btn-primary:hover { opacity: 0.9; transform: translateY(-1px); }
@@ -240,6 +415,15 @@ const BASE_STYLES = `
   .btn-sm { padding: 5px 10px; font-size: 11px; }
   .btn-ghost { background: transparent; color: #94a3b8; border: 1px solid rgba(255,255,255,0.08); }
   .btn-ghost:hover { background: rgba(255,255,255,0.05); color: #e2e8f0; }
+  .btn-orange { background: rgba(249,115,22,0.15); color: #fb923c; border: 1px solid rgba(249,115,22,0.3); }
+  .btn-orange:hover { background: rgba(249,115,22,0.25); }
+  .btn-green { background: rgba(34,197,94,0.1); color: #4ade80; border: 1px solid rgba(34,197,94,0.2); }
+  .btn-green:hover { background: rgba(34,197,94,0.2); }
+  
+  /* Admin mode banner */
+  .admin-banner { background: linear-gradient(135deg, rgba(249,115,22,0.15), rgba(234,88,12,0.1)); border: 1px solid rgba(249,115,22,0.4); border-radius: 10px; padding: 12px 16px; margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between; }
+  .admin-banner-text { font-size: 13px; font-weight: 600; color: #fb923c; }
+  .admin-banner-timer { font-size: 11px; color: #f97316; font-family: monospace; }
   
   table { width: 100%; border-collapse: collapse; }
   th { text-align: left; padding: 10px 12px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px; color: #64748b; border-bottom: 1px solid rgba(255,255,255,0.06); }
@@ -250,6 +434,16 @@ const BASE_STYLES = `
   .pass-reveal { font-family: monospace; color: #e2e8f0; }
   .url-link { color: #818cf8; font-size: 12px; }
   .url-link:hover { color: #a78bfa; text-decoration: underline; }
+  
+  /* GCP Secrets table */
+  .secrets-panel { background: rgba(0,0,0,0.2); border: 1px solid rgba(99,102,241,0.1); border-radius: 12px; padding: 20px; margin-top: 24px; }
+  .secrets-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+  .secrets-title { font-size: 14px; font-weight: 600; color: #a78bfa; flex: 1; }
+  .secret-value-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 200; align-items: center; justify-content: center; }
+  .secret-value-modal.open { display: flex; }
+  .secret-modal-box { background: #0f0f1a; border: 1px solid rgba(99,102,241,0.3); border-radius: 14px; padding: 24px; width: 100%; max-width: 500px; }
+  .secret-value-display { background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 12px 14px; font-family: monospace; font-size: 12px; color: #94a3b8; word-break: break-all; margin: 12px 0; cursor: pointer; transition: all 0.15s; min-height: 40px; }
+  .secret-value-display.revealed { color: #e2e8f0; background: rgba(99,102,241,0.05); }
   
   /* Modal */
   .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; }
@@ -263,14 +457,11 @@ const BASE_STYLES = `
   textarea { resize: vertical; min-height: 60px; }
   .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
   
-  /* Stats */
-  .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; margin-bottom: 24px; }
-  .stat-card { background: rgba(99,102,241,0.06); border: 1px solid rgba(99,102,241,0.15); border-radius: 10px; padding: 16px; }
-  .stat-value { font-size: 28px; font-weight: 700; color: #a78bfa; }
-  .stat-label { font-size: 11px; color: #64748b; margin-top: 4px; }
-  
   /* Hamburger (mobile) */
   .hamburger { display: none; background: none; border: none; color: #94a3b8; cursor: pointer; padding: 4px; }
+  @media (max-width: 900px) {
+    .vm-grid { grid-template-columns: 1fr; }
+  }
   @media (max-width: 768px) {
     .hamburger { display: block; }
     .sidebar { position: fixed; left: -220px; top: 0; bottom: 0; z-index: 50; transition: left 0.2s; }
@@ -283,6 +474,7 @@ function sidebarHTML(active) {
     { id: 'dashboard', label: 'Dashboard', icon: '⬡', href: '/dashboard' },
     { id: 'vault', label: 'Password Vault', icon: '🔐', href: '/vault' },
     { id: 'launcher', label: 'Fleet Launcher', icon: '🚀', href: '/launcher' },
+    { id: 'infrastructure', label: 'Infrastructure', icon: '🏗', href: '/infrastructure' },
   ];
   return `
     <div class="sidebar" id="sidebar">
@@ -315,7 +507,7 @@ function sidebarHTML(active) {
   `;
 }
 
-function pageShell(title, active, content) {
+function pageShell(title, active, content, extraScript) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -340,6 +532,7 @@ function pageShell(title, active, content) {
       </div>
     </div>
   </div>
+  ${extraScript || ''}
 </body>
 </html>`;
 }
@@ -386,54 +579,188 @@ function loginPage(error) {
 </html>`;
 }
 
-function dashboardPage() {
-  const appCount = FLEET_APPS.length;
-  const statsHTML = `
-    <div class="stats-grid">
-      <div class="stat-card">
-        <div class="stat-value">${appCount}</div>
-        <div class="stat-label">Fleet Apps</div>
+function relationshipDiagramHTML() {
+  return `
+    <div class="rel-diagram">
+      <div class="rel-diagram-title">Fleet Topology</div>
+      <div style="display:flex;justify-content:center;gap:0;align-items:flex-start;flex-wrap:wrap">
+        <!-- Left: fleet-vm column -->
+        <div class="rel-down" style="min-width:160px;align-items:center">
+          <div class="rel-node">🖥 fleet-vm</div>
+          <div class="rel-vert-arrow">↓</div>
+          <div class="rel-node sub">keeper / NCL</div>
+          <div class="rel-vert-arrow">↓</div>
+          <div class="rel-node sub">GCP Secret Manager</div>
+        </div>
+        <!-- Center: DB -->
+        <div style="display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding-top:0;min-width:200px">
+          <div style="display:flex;align-items:center;gap:8px">
+            <div class="rel-arrow">←→</div>
+            <div class="rel-down">
+              <div class="rel-node db">🗄 Cloud SQL fleet-db</div>
+              <div style="font-size:10px;color:#64748b;text-align:center;margin-top:4px">34.58.162.212</div>
+            </div>
+            <div class="rel-arrow">←→</div>
+          </div>
+        </div>
+        <!-- Right: clawforge-vm column -->
+        <div class="rel-down" style="min-width:160px;align-items:center">
+          <div class="rel-node">🖥 clawforge-vm</div>
+          <div class="rel-vert-arrow">↓</div>
+          <div class="rel-node sub">ClawForge SaaS</div>
+        </div>
       </div>
-      <div class="stat-card">
-        <div class="stat-value" style="color:#34d399">${appCount}</div>
-        <div class="stat-label">Online</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-value">1</div>
-        <div class="stat-label">VM (fleet-vm)</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-value">🔐</div>
-        <div class="stat-label">Vault Active</div>
+      <div style="text-align:center;margin-top:16px;font-size:10px;color:#475569">
+        GCP Project: boxwood-yen-465815-h0 · Zone: us-central1-a
       </div>
     </div>
   `;
-  const appGrid = `
-    <div class="card" style="margin-bottom:20px">
-      <div class="card-title">Fleet Apps</div>
-      <div class="app-grid">
-        ${FLEET_APPS.map(a => `
-          <a class="app-tile" href="${a.url}" target="_blank">
+}
+
+function dashboardPage() {
+  const totalApps = FLEET_VM_APPS.length + CLAWFORGE_VM_APPS.length;
+  const summaryBar = `
+    <div class="summary-bar">
+      <div class="summary-item">
+        <div class="summary-value">${totalApps}</div>
+        <div class="summary-label">Total Apps</div>
+      </div>
+      <div class="summary-item">
+        <div class="summary-value">2</div>
+        <div class="summary-label">VMs</div>
+      </div>
+      <div class="summary-item">
+        <div class="summary-value" style="font-size:13px;color:#34d399;padding-top:4px">34.58.162.212</div>
+        <div class="summary-label">Cloud SQL Host</div>
+      </div>
+      <div class="summary-item">
+        <div class="summary-value" style="font-size:12px;padding-top:4px">boxwood-yen-465815-h0</div>
+        <div class="summary-label">GCP Project</div>
+      </div>
+      <div class="summary-item">
+        <div class="summary-value">🔐</div>
+        <div class="summary-label">Vault Active</div>
+      </div>
+    </div>
+  `;
+
+  const fleetVmCard = `
+    <div class="vm-card">
+      <div class="vm-card-header">
+        <div class="vm-icon">🖥</div>
+        <div>
+          <div class="vm-name">fleet-vm</div>
+          <div class="vm-meta">34.122.171.173 · us-central1-a</div>
+          <div class="vm-meta" style="margin-top:3px"><span class="vm-badge">e2-standard-4 · 4vCPU · 16GB</span></div>
+        </div>
+        <div style="margin-left:auto;font-size:11px;color:#64748b" id="fleet-refresh-time"></div>
+      </div>
+      <div class="app-grid" id="fleet-app-grid">
+        ${FLEET_VM_APPS.map(a => `
+          ${a.url ? `<a class="app-tile" href="${a.url}" target="_blank" id="tile-fleet-${a.svc}">` : `<div class="app-tile" id="tile-fleet-${a.svc}">`}
             <div class="app-tile-header">
               <span class="app-tile-name">${a.name}</span>
-              <div class="app-tile-status"><div class="status-dot"></div></div>
+              <div class="status-dot loading" id="dot-fleet-${a.svc}"></div>
             </div>
             <div class="app-tile-desc">${a.desc}</div>
-            <div class="app-tile-url">${a.url.replace('https://', '')}</div>
-          </a>
+            <div class="app-tile-port">:${a.port}</div>
+            ${a.url ? `<div class="app-tile-url">${a.url.replace('https://', '')}</div>` : ''}
+          ${a.url ? '</a>' : '</div>'}
         `).join('')}
       </div>
     </div>
   `;
-  return pageShell('Dashboard', 'dashboard', statsHTML + appGrid);
+
+  const clawforgeVmCard = `
+    <div class="vm-card">
+      <div class="vm-card-header">
+        <div class="vm-icon">🏗</div>
+        <div>
+          <div class="vm-name">clawforge-vm</div>
+          <div class="vm-meta">34.10.77.209 · us-central1-a</div>
+          <div class="vm-meta" style="margin-top:3px"><span class="vm-badge">e2-small · 2vCPU · 2GB</span></div>
+        </div>
+      </div>
+      <div class="app-grid" id="clawforge-app-grid">
+        ${CLAWFORGE_VM_APPS.map(a => `
+          ${a.url ? `<a class="app-tile" href="${a.url}" target="_blank" id="tile-cf-${a.svc}">` : `<div class="app-tile" id="tile-cf-${a.svc}">`}
+            <div class="app-tile-header">
+              <span class="app-tile-name">${a.name}</span>
+              <div class="status-dot loading" id="dot-cf-${a.svc}"></div>
+            </div>
+            <div class="app-tile-desc">${a.desc}</div>
+            <div class="app-tile-port">:${a.port}</div>
+            ${a.url ? `<div class="app-tile-url">${a.url.replace('https://', '')}</div>` : ''}
+          ${a.url ? '</a>' : '</div>'}
+        `).join('')}
+      </div>
+    </div>
+  `;
+
+  const content = summaryBar + `
+    <div class="vm-grid">${fleetVmCard}${clawforgeVmCard}</div>
+    ${relationshipDiagramHTML()}
+  `;
+
+  const script = `<script>
+    async function loadStatus() {
+      try {
+        const r = await fetch('/api/status');
+        const data = await r.json();
+        // fleet-vm dots
+        const fleet = data.fleet || {};
+        ${FLEET_VM_APPS.map(a => `
+          {
+            const dot = document.getElementById('dot-fleet-${a.svc}');
+            if (dot) {
+              const active = fleet['${a.svc}'];
+              dot.className = 'status-dot ' + (active === true ? 'green' : active === false ? 'red' : 'loading');
+            }
+          }
+        `).join('')}
+        // clawforge-vm dots
+        const cf = data.clawforge || {};
+        ${CLAWFORGE_VM_APPS.map(a => `
+          {
+            const dot = document.getElementById('dot-cf-${a.svc}');
+            if (dot) {
+              const active = cf['${a.svc}'];
+              dot.className = 'status-dot ' + (active === true ? 'green' : active === false ? 'red' : 'loading');
+            }
+          }
+        `).join('')}
+        document.getElementById('fleet-refresh-time').textContent = 'Updated ' + new Date().toLocaleTimeString();
+      } catch(e) {
+        console.error('Status fetch failed:', e);
+      }
+    }
+    loadStatus();
+    // Refresh every 60s
+    setInterval(loadStatus, 60000);
+  </script>`;
+
+  return pageShell('Dashboard', 'dashboard', content, script);
 }
 
 function vaultPage() {
   const content = `
-    <div class="card">
+    <!-- Admin mode banner (hidden by default) -->
+    <div class="admin-banner" id="admin-banner" style="display:none">
+      <div>
+        <div class="admin-banner-text">🔓 Admin Mode Active</div>
+        <div style="font-size:11px;color:#f97316;margin-top:2px">Edit and delete operations enabled</div>
+      </div>
+      <div style="text-align:right">
+        <div class="admin-banner-timer" id="admin-timer">10:00</div>
+        <button class="btn btn-sm" style="margin-top:4px;background:rgba(249,115,22,0.2);color:#fb923c;border:1px solid rgba(249,115,22,0.3)" onclick="deactivateAdmin()">Exit Admin</button>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:24px">
       <div class="vault-toolbar">
         <span style="font-size:14px;font-weight:600;color:#a78bfa;flex:1">🔐 Password Vault</span>
-        <button class="btn btn-primary" onclick="openModal()">+ Add Entry</button>
+        <button class="btn btn-orange btn-sm" id="admin-mode-btn" onclick="toggleAdminMode()">🔑 Admin Mode</button>
+        <button class="btn btn-primary" id="add-entry-btn" style="display:none" onclick="openModal()">+ Add Entry</button>
       </div>
       <div id="vault-table-wrap">
         <table>
@@ -444,7 +771,7 @@ function vaultPage() {
               <th>Password</th>
               <th>URL</th>
               <th>Notes</th>
-              <th>Actions</th>
+              <th id="actions-col" style="display:none">Actions</th>
             </tr>
           </thead>
           <tbody id="vault-rows">
@@ -453,7 +780,19 @@ function vaultPage() {
         </table>
       </div>
     </div>
-    
+
+    <!-- GCP Secret Manager panel -->
+    <div class="secrets-panel">
+      <div class="secrets-header">
+        <div class="secrets-title">🔒 GCP Secret Manager</div>
+        <a href="https://console.cloud.google.com/security/secret-manager?project=boxwood-yen-465815-h0" target="_blank" class="btn btn-ghost btn-sm">↗ Open in GCP Console</a>
+        <button class="btn btn-ghost btn-sm" onclick="loadSecrets()">↺ Refresh</button>
+      </div>
+      <div id="secrets-content">
+        <div style="text-align:center;color:#475569;padding:24px">Loading secrets...</div>
+      </div>
+    </div>
+
     <!-- Add/Edit Modal -->
     <div class="modal-overlay" id="vault-modal">
       <div class="modal">
@@ -470,10 +809,100 @@ function vaultPage() {
         </div>
       </div>
     </div>
-    
-    <script>
+
+    <!-- Admin mode unlock modal -->
+    <div class="modal-overlay" id="admin-modal">
+      <div class="modal" style="max-width:360px">
+        <h3>🔑 Enter Admin Password</h3>
+        <div class="form-group"><label>Admin Vault Password</label><input id="admin-pass-input" type="password" placeholder="Admin password" onkeydown="if(event.key==='Enter')submitAdmin()"></div>
+        <div id="admin-error" style="color:#f87171;font-size:12px;margin-top:-8px;margin-bottom:8px;display:none">Incorrect password</div>
+        <div class="modal-actions">
+          <button class="btn btn-ghost" onclick="closeAdminModal()">Cancel</button>
+          <button class="btn btn-orange" onclick="submitAdmin()">Unlock Admin Mode</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Secret value modal -->
+    <div class="secret-value-modal" id="secret-modal">
+      <div class="secret-modal-box">
+        <h3 style="font-size:15px;font-weight:600;color:#f1f5f9;margin-bottom:4px">Secret Value</h3>
+        <div style="font-size:11px;color:#64748b;margin-bottom:12px" id="secret-modal-name"></div>
+        <div class="secret-value-display" id="secret-val-display" onclick="toggleSecretReveal()">Click to reveal</div>
+        <div style="font-size:11px;color:#64748b;margin-bottom:12px">Click value to reveal · <span id="secret-copy-btn" style="color:#818cf8;cursor:pointer" onclick="copySecretVal()">Copy to clipboard</span></div>
+        <div class="modal-actions">
+          <button class="btn btn-ghost" onclick="closeSecretModal()">Close</button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const script = `<script>
     let vaultData = [];
-    
+    let adminMode = false;
+    let adminTimer = null;
+    let adminSeconds = 600;
+    let secretVal = '';
+    let secretRevealed = false;
+
+    // ---- Admin mode ----
+    function toggleAdminMode() {
+      if (adminMode) { deactivateAdmin(); return; }
+      document.getElementById('admin-modal').classList.add('open');
+      setTimeout(() => document.getElementById('admin-pass-input').focus(), 50);
+    }
+    function closeAdminModal() {
+      document.getElementById('admin-modal').classList.remove('open');
+      document.getElementById('admin-pass-input').value = '';
+      document.getElementById('admin-error').style.display = 'none';
+    }
+    function submitAdmin() {
+      const pw = document.getElementById('admin-pass-input').value;
+      if (pw === 'DeepTx-Admin99') {
+        closeAdminModal();
+        activateAdmin();
+      } else {
+        document.getElementById('admin-error').style.display = 'block';
+      }
+    }
+    function activateAdmin() {
+      adminMode = true;
+      adminSeconds = 600;
+      document.getElementById('admin-banner').style.display = 'flex';
+      document.getElementById('add-entry-btn').style.display = 'inline-block';
+      document.getElementById('actions-col').style.display = '';
+      document.getElementById('admin-mode-btn').textContent = '🔒 Exit Admin';
+      document.getElementById('admin-mode-btn').className = 'btn btn-sm btn-danger';
+      renderTable();
+      startAdminTimer();
+    }
+    function deactivateAdmin() {
+      adminMode = false;
+      clearInterval(adminTimer);
+      document.getElementById('admin-banner').style.display = 'none';
+      document.getElementById('add-entry-btn').style.display = 'none';
+      document.getElementById('actions-col').style.display = 'none';
+      document.getElementById('admin-mode-btn').textContent = '🔑 Admin Mode';
+      document.getElementById('admin-mode-btn').className = 'btn btn-orange btn-sm';
+      renderTable();
+    }
+    function startAdminTimer() {
+      clearInterval(adminTimer);
+      adminTimer = setInterval(() => {
+        adminSeconds--;
+        const m = Math.floor(adminSeconds / 60).toString().padStart(2,'0');
+        const s = (adminSeconds % 60).toString().padStart(2,'0');
+        document.getElementById('admin-timer').textContent = m + ':' + s;
+        if (adminSeconds <= 0) deactivateAdmin();
+      }, 1000);
+    }
+    function resetAdminTimer() {
+      if (adminMode) { adminSeconds = 600; }
+    }
+    document.addEventListener('click', resetAdminTimer);
+    document.addEventListener('keydown', resetAdminTimer);
+
+    // ---- Vault ----
     async function loadVault() {
       try {
         const r = await fetch('/api/vault');
@@ -483,70 +912,94 @@ function vaultPage() {
         document.getElementById('vault-rows').innerHTML = '<tr><td colspan="6" style="color:#f87171;text-align:center">Error loading vault</td></tr>';
       }
     }
-    
+
     function renderTable() {
       const tbody = document.getElementById('vault-rows');
       if (!vaultData.length) {
-        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#475569;padding:24px">No entries yet. Add your first credential.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#475569;padding:24px">No entries yet.</td></tr>';
         return;
       }
-      tbody.innerHTML = vaultData.map(e => \`
-        <tr>
-          <td style="font-weight:500">\${esc(e.name)}</td>
-          <td style="font-family:monospace;font-size:12px">\${esc(e.username || '—')}</td>
-          <td>
-            <div class="pass-cell">
-              <span id="pass-\${e.id}" class="pass-masked">••••••••</span>
-              <button class="btn btn-ghost btn-sm" onclick="togglePass(\${e.id}, \${JSON.stringify(esc(e.password_dec))})">👁</button>
-              <button class="btn btn-ghost btn-sm" onclick="copyText(\${JSON.stringify(e.password_dec)})">📋</button>
-            </div>
-          </td>
-          <td>\${e.url ? \`<a class="url-link" href="\${esc(e.url)}" target="_blank">\${esc(e.url.replace('https://',''))}</a>\` : '—'}</td>
-          <td style="font-size:12px;color:#64748b;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${esc(e.notes || '—')}</td>
-          <td>
-            <div style="display:flex;gap:4px">
-              <button class="btn btn-ghost btn-sm" onclick="editEntry(\${e.id})">✏️</button>
-              <button class="btn btn-danger btn-sm" onclick="deleteEntry(\${e.id})">🗑</button>
-            </div>
-          </td>
-        </tr>
-      \`).join('');
+      tbody.innerHTML = vaultData.map(e => {
+        const actionsCol = adminMode
+          ? '<td><div style="display:flex;gap:4px"><button class="btn btn-ghost btn-sm" onclick="editEntry(' + e.id + ')">✏️</button><button class="btn btn-danger btn-sm" onclick="deleteEntry(' + e.id + ')">🗑</button></div></td>'
+          : '<td></td>';
+        return '<tr>' +
+          '<td style="font-weight:500">' + esc(e.name) + '</td>' +
+          '<td style="font-family:monospace;font-size:12px">' + esc(e.username || '—') + '</td>' +
+          '<td><div class="pass-cell">' +
+            '<span id="pass-' + e.id + '" class="pass-masked">••••••••</span>' +
+            '<button class="btn btn-ghost btn-sm" id="reveal-btn-' + e.id + '" onclick="revealPass(' + e.id + ')">👁</button>' +
+            '<button class="btn btn-ghost btn-sm" onclick="copyPassById(' + e.id + ')">📋</button>' +
+          '</div></td>' +
+          '<td>' + (e.url ? '<a class="url-link" href="' + esc(e.url) + '" target="_blank">' + esc(e.url.replace('https://','')) + '</a>' : '—') + '</td>' +
+          '<td style="font-size:12px;color:#64748b;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(e.notes || '—') + '</td>' +
+          actionsCol +
+        '</tr>';
+      }).join('');
     }
-    
-    function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-    
-    function togglePass(id, val) {
+
+    function esc(s) {
+      return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    let revealTimers = {};
+    async function revealPass(id) {
       const el = document.getElementById('pass-' + id);
-      if (el.classList.contains('pass-masked')) {
-        el.classList.remove('pass-masked'); el.classList.add('pass-reveal');
-        el.textContent = val;
-      } else {
+      if (!el) return;
+      if (el.classList.contains('pass-reveal')) {
         el.classList.remove('pass-reveal'); el.classList.add('pass-masked');
         el.textContent = '••••••••';
+        clearTimeout(revealTimers[id]);
+        return;
+      }
+      // Fetch from server
+      try {
+        const r = await fetch('/api/vault/' + id + '/reveal');
+        const data = await r.json();
+        el.classList.remove('pass-masked'); el.classList.add('pass-reveal');
+        el.textContent = data.password || '';
+        // Re-mask after 30s
+        clearTimeout(revealTimers[id]);
+        revealTimers[id] = setTimeout(() => {
+          el.classList.remove('pass-reveal'); el.classList.add('pass-masked');
+          el.textContent = '••••••••';
+        }, 30000);
+      } catch(err) {
+        el.textContent = '[error]';
       }
     }
-    
-    function copyText(text) {
-      navigator.clipboard.writeText(text).then(() => {
-        const t = document.createElement('div');
-        t.textContent = 'Copied!';
-        t.style.cssText = 'position:fixed;bottom:20px;right:20px;background:#6366f1;color:white;padding:8px 16px;border-radius:8px;z-index:999;font-size:13px';
-        document.body.appendChild(t);
-        setTimeout(() => t.remove(), 2000);
-      });
+
+    async function copyPassById(id) {
+      const el = document.getElementById('pass-' + id);
+      let pw = '';
+      if (el && el.classList.contains('pass-reveal')) {
+        pw = el.textContent;
+      } else {
+        try {
+          const r = await fetch('/api/vault/' + id + '/reveal');
+          const data = await r.json();
+          pw = data.password || '';
+        } catch { return; }
+      }
+      navigator.clipboard.writeText(pw).then(() => toast('Copied!'));
     }
-    
-    function openModal(id) {
+
+    function toast(msg) {
+      const t = document.createElement('div');
+      t.textContent = msg;
+      t.style.cssText = 'position:fixed;bottom:20px;right:20px;background:#6366f1;color:white;padding:8px 16px;border-radius:8px;z-index:999;font-size:13px';
+      document.body.appendChild(t);
+      setTimeout(() => t.remove(), 2000);
+    }
+
+    function openModal() {
       document.getElementById('vault-modal').classList.add('open');
-      if (!id) {
-        document.getElementById('modal-title').textContent = 'Add Entry';
-        document.getElementById('edit-id').value = '';
-        ['f-name','f-user','f-pass','f-url','f-notes'].forEach(i => document.getElementById(i).value = '');
-      }
+      document.getElementById('modal-title').textContent = 'Add Entry';
+      document.getElementById('edit-id').value = '';
+      ['f-name','f-user','f-pass','f-url','f-notes'].forEach(i => document.getElementById(i).value = '');
     }
-    
     function closeModal() { document.getElementById('vault-modal').classList.remove('open'); }
-    
+
     function editEntry(id) {
       const e = vaultData.find(x => x.id === id);
       if (!e) return;
@@ -554,12 +1007,12 @@ function vaultPage() {
       document.getElementById('edit-id').value = id;
       document.getElementById('f-name').value = e.name || '';
       document.getElementById('f-user').value = e.username || '';
-      document.getElementById('f-pass').value = e.password_dec || '';
+      document.getElementById('f-pass').value = '';
       document.getElementById('f-url').value = e.url || '';
       document.getElementById('f-notes').value = e.notes || '';
       document.getElementById('vault-modal').classList.add('open');
     }
-    
+
     async function saveEntry() {
       const id = document.getElementById('edit-id').value;
       const body = {
@@ -576,22 +1029,116 @@ function vaultPage() {
       closeModal();
       loadVault();
     }
-    
+
     async function deleteEntry(id) {
       if (!confirm('Delete this entry?')) return;
       await fetch('/api/vault/' + id, { method: 'DELETE' });
       loadVault();
     }
-    
-    // Close modal on backdrop click
+
     document.getElementById('vault-modal').addEventListener('click', e => {
       if (e.target === e.currentTarget) closeModal();
     });
-    
+    document.getElementById('admin-modal').addEventListener('click', e => {
+      if (e.target === e.currentTarget) closeAdminModal();
+    });
+
+    // ---- GCP Secrets ----
+    async function loadSecrets() {
+      const cont = document.getElementById('secrets-content');
+      cont.innerHTML = '<div style="text-align:center;color:#475569;padding:20px">Loading...</div>';
+      try {
+        const r = await fetch('/api/gcp-secrets');
+        if (!r.ok) {
+          const err = await r.json();
+          cont.innerHTML = '<div style="color:#f87171;padding:16px;font-size:13px">⚠ ' + esc(err.error || 'Error fetching secrets') + (err.hint ? '<br><span style="color:#64748b;font-size:11px">' + esc(err.hint) + '</span>' : '') + '</div>';
+          return;
+        }
+        const data = await r.json();
+        const secrets = data.secrets || [];
+        if (!secrets.length) {
+          cont.innerHTML = '<div style="text-align:center;color:#475569;padding:20px">No secrets found.</div>';
+          return;
+        }
+        cont.innerHTML = '<table>' +
+          '<thead><tr><th>Secret Name</th><th>Created</th><th style="' + (adminMode ? '' : 'display:none') + '" id="secret-actions-th">Actions</th></tr></thead>' +
+          '<tbody>' +
+          secrets.map(s => {
+            const created = s.createTime ? new Date(s.createTime).toLocaleDateString() : '—';
+            const actionBtn = adminMode
+              ? '<button class="btn btn-ghost btn-sm" onclick="viewSecret(\'' + esc(s.name) + '\')">👁 View Value</button>'
+              : '<span style="color:#475569;font-size:11px">Admin mode required</span>';
+            return '<tr>' +
+              '<td style="font-family:monospace;font-size:12px;color:#a78bfa">' + esc(s.name) + '</td>' +
+              '<td style="font-size:12px;color:#64748b">' + created + '</td>' +
+              '<td>' + actionBtn + '</td>' +
+            '</tr>';
+          }).join('') +
+          '</tbody></table>';
+      } catch(e) {
+        cont.innerHTML = '<div style="color:#f87171;padding:16px;font-size:13px">⚠ ' + esc(e.message) + '</div>';
+      }
+    }
+
+    async function viewSecret(name) {
+      if (!adminMode) { alert('Admin mode required to view secret values'); return; }
+      const modal = document.getElementById('secret-modal');
+      const display = document.getElementById('secret-val-display');
+      document.getElementById('secret-modal-name').textContent = name;
+      display.textContent = 'Loading...';
+      display.className = 'secret-value-display';
+      secretVal = '';
+      secretRevealed = false;
+      modal.classList.add('open');
+      try {
+        const r = await fetch('/api/gcp-secrets/' + encodeURIComponent(name), {
+          headers: { 'x-admin-mode': '1' }
+        });
+        if (!r.ok) {
+          const err = await r.json();
+          display.textContent = 'Error: ' + (err.error || 'Unknown error');
+          return;
+        }
+        const data = await r.json();
+        secretVal = data.value || '';
+        display.textContent = '●'.repeat(Math.min(secretVal.length, 20)) + ' (click to reveal)';
+      } catch(e) {
+        display.textContent = 'Error: ' + e.message;
+      }
+    }
+
+    function toggleSecretReveal() {
+      const display = document.getElementById('secret-val-display');
+      if (!secretVal) return;
+      secretRevealed = !secretRevealed;
+      if (secretRevealed) {
+        display.textContent = secretVal;
+        display.className = 'secret-value-display revealed';
+      } else {
+        display.textContent = '●'.repeat(Math.min(secretVal.length, 20)) + ' (click to reveal)';
+        display.className = 'secret-value-display';
+      }
+    }
+
+    function copySecretVal() {
+      if (!secretVal) return;
+      navigator.clipboard.writeText(secretVal).then(() => toast('Secret copied!'));
+    }
+
+    function closeSecretModal() {
+      document.getElementById('secret-modal').classList.remove('open');
+      secretVal = '';
+      secretRevealed = false;
+    }
+    document.getElementById('secret-modal').addEventListener('click', e => {
+      if (e.target === e.currentTarget) closeSecretModal();
+    });
+
     loadVault();
-    </script>
-  `;
-  return pageShell('Password Vault', 'vault', content);
+    loadSecrets();
+  </script>`;
+
+  return pageShell('Password Vault', 'vault', content, script);
 }
 
 function launcherPage() {
@@ -605,10 +1152,7 @@ function launcherPage() {
         <a class="app-tile" href="${a.url}" target="_blank">
           <div class="app-tile-header">
             <span class="app-tile-name">${a.name}</span>
-            <div class="app-tile-status">
-              <div class="status-dot"></div>
-              <span style="font-size:9px;color:#34d399">●</span>
-            </div>
+            <div class="status-dot green"></div>
           </div>
           <div class="app-tile-desc">${a.desc}</div>
           <div class="app-tile-url">${a.url.replace('https://', '')}</div>
@@ -619,9 +1163,64 @@ function launcherPage() {
   return pageShell('Fleet Launcher', 'launcher', content);
 }
 
+function infrastructurePage() {
+  const content = `
+    <div style="margin-bottom:24px">
+      <h3 style="font-size:18px;font-weight:600;color:#f1f5f9;margin-bottom:4px">🏗 Infrastructure</h3>
+      <p style="font-size:13px;color:#64748b">GCP fleet topology and relationships</p>
+    </div>
+    ${relationshipDiagramHTML()}
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:20px">
+      <div class="card">
+        <div class="card-title">🖥 fleet-vm</div>
+        <div style="font-size:13px;color:#94a3b8;line-height:1.8">
+          <div><span style="color:#64748b">IP:</span> 34.122.171.173</div>
+          <div><span style="color:#64748b">Type:</span> e2-standard-4</div>
+          <div><span style="color:#64748b">vCPU:</span> 4 · <span style="color:#64748b">RAM:</span> 16GB</div>
+          <div><span style="color:#64748b">Zone:</span> us-central1-a</div>
+          <div><span style="color:#64748b">Apps:</span> ${FLEET_VM_APPS.length}</div>
+          <div style="margin-top:12px;font-size:11px;color:#475569">${FLEET_VM_APPS.map(a => a.name).join(' · ')}</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">🏗 clawforge-vm</div>
+        <div style="font-size:13px;color:#94a3b8;line-height:1.8">
+          <div><span style="color:#64748b">IP:</span> 34.10.77.209</div>
+          <div><span style="color:#64748b">Type:</span> e2-small</div>
+          <div><span style="color:#64748b">vCPU:</span> 2 · <span style="color:#64748b">RAM:</span> 2GB</div>
+          <div><span style="color:#64748b">Zone:</span> us-central1-a</div>
+          <div><span style="color:#64748b">Apps:</span> ${CLAWFORGE_VM_APPS.length}</div>
+          <div style="margin-top:12px;font-size:11px;color:#475569">${CLAWFORGE_VM_APPS.map(a => a.name).join(' · ')}</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">🗄 Cloud SQL fleet-db</div>
+        <div style="font-size:13px;color:#94a3b8;line-height:1.8">
+          <div><span style="color:#64748b">Host:</span> 34.58.162.212</div>
+          <div><span style="color:#64748b">Engine:</span> PostgreSQL</div>
+          <div><span style="color:#64748b">DB:</span> admindb (+ fleet app DBs)</div>
+          <div><span style="color:#64748b">Users:</span> adminuser, others per-app</div>
+          <div style="margin-top:8px;font-size:11px;color:#475569">Shared by all fleet apps on both VMs</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">🔒 GCP Secret Manager</div>
+        <div style="font-size:13px;color:#94a3b8;line-height:1.8">
+          <div><span style="color:#64748b">Project:</span> boxwood-yen-465815-h0</div>
+          <div><span style="color:#64748b">SA:</span> openclaw-agent@...</div>
+          <div style="margin-top:8px">
+            <a href="https://console.cloud.google.com/security/secret-manager?project=boxwood-yen-465815-h0" target="_blank" class="btn btn-ghost btn-sm">↗ Open Console</a>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  return pageShell('Infrastructure', 'infrastructure', content);
+}
+
 // Start server
 initDB().then(() => {
   app.listen(PORT, () => {
-    console.log(`Fleet Admin running on port ${PORT}`);
+    console.log('Fleet Admin running on port ' + PORT);
   });
 });
