@@ -1,0 +1,43 @@
+name: Branch Policy Enforcement
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  check-branch-name:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check branch naming convention
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          echo "Checking branch: $BRANCH"
+
+          # Must start with claw/
+          if [[ ! "$BRANCH" =~ ^claw/ ]]; then
+            echo "❌ Branch must start with 'claw/' — got: $BRANCH"
+            echo "   Correct format: claw/noun-verb-noun-description-minimum-sixty-chars"
+            exit 1
+          fi
+
+          # Must be at least 60 characters total
+          LEN=${#BRANCH}
+          if [ "$LEN" -lt 60 ]; then
+            echo "❌ Branch name too short: $LEN chars (minimum 60 required)"
+            echo "   Got: $BRANCH"
+            echo "   Example: claw/clawforge-dashboard-add-stripe-billing-integration-flow"
+            exit 1
+          fi
+
+          # Extract slug after claw/ and check noun-verb-noun (min 3 segments)
+          SLUG="${BRANCH#claw/}"
+          SEGMENT_COUNT=$(echo "$SLUG" | tr '-' '\n' | grep -c .)
+          if [ "$SEGMENT_COUNT" -lt 3 ]; then
+            echo "❌ Branch must follow noun-verb-noun pattern (min 3 hyphen-separated words)"
+            echo "   Got: $SLUG ($SEGMENT_COUNT segments)"
+            echo "   Example: claw/clawforge-stripe-add-billing-integration-and-webhook-handling"
+            exit 1
+          fi
+
+          echo "✅ Branch policy passed: $BRANCH"
+          echo "   Length: $LEN chars | Segments: $SEGMENT_COUNT"
